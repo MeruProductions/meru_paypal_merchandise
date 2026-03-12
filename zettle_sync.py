@@ -45,17 +45,19 @@ REDUCED_VAT_PRODUCTS = {"food", "drinks", "boeken", "books"}
 # Product group extraction: first word of the product name
 # e.g. "T-shirt M" → "T-shirt", "Vinyl LP" → "Vinyl"
 
-ACCOUNTS = []
+# Each entry: (env_var_name, artist_display_name)
+ACCOUNT_DEFS = [
+    ("MERU_PAYPAL_MATTHIJN", "Matthijn"),
+    ("MERU_PAYPAL_TIMZINGT", "TimZingt"),
+]
 
-for i in (1, 2):
-    client_id = os.getenv(f"ZETTLE_ACCOUNT{i}_CLIENT_ID")
-    client_secret = os.getenv(f"ZETTLE_ACCOUNT{i}_CLIENT_SECRET")
-    artist_name = os.getenv(f"ZETTLE_ACCOUNT{i}_ARTIST_NAME", f"Account {i}")
-    if client_id and client_secret:
+ACCOUNTS = []
+for env_var, artist_name in ACCOUNT_DEFS:
+    api_key = os.getenv(env_var)
+    if api_key:
         ACCOUNTS.append(
             {
-                "client_id": client_id,
-                "client_secret": client_secret,
+                "api_key": api_key,
                 "artist_name": artist_name,
             }
         )
@@ -90,14 +92,13 @@ logger.addHandler(console_handler)
 # ---------------------------------------------------------------------------
 
 
-def zettle_get_token(client_id: str, client_secret: str) -> str:
-    """Obtain an OAuth2 access token from Zettle."""
+def zettle_get_token(api_key: str) -> str:
+    """Obtain an OAuth2 access token from Zettle using the API key."""
     resp = requests.post(
         ZETTLE_TOKEN_URL,
         data={
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "client_id": client_id,
-            "assertion": client_secret,
+            "assertion": api_key,
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
@@ -415,9 +416,7 @@ def sync(start_date: str, end_date: str) -> None:
 
         # Authenticate
         try:
-            token = zettle_get_token(
-                account["client_id"], account["client_secret"]
-            )
+            token = zettle_get_token(account["api_key"])
         except requests.RequestException as e:
             logger.error("Auth failed for %s: %s", artist, e)
             continue

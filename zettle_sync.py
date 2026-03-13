@@ -198,20 +198,50 @@ def notion_fetch_product_catalog() -> dict[str, dict]:
     return catalog
 
 
-def notion_fetch_existing_tx_ids() -> dict[str, str]:
-    """Returns {transactionId: pageId} from Zettle Transactions DB."""
+def notion_query_filtered(database_id: str, date_filter: dict) -> list[dict]:
+    """Fetch pages from a Notion database with a filter."""
+    pages = []
+    start_cursor = None
+    while True:
+        body: dict = {"page_size": 100, "filter": date_filter}
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        resp = requests.post(
+            f"{NOTION_API_URL}/databases/{database_id}/query",
+            headers=notion_headers(),
+            json=body,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        start_cursor = data.get("next_cursor")
+    return pages
+
+
+def notion_fetch_existing_tx_ids(start_date: str, end_date: str) -> dict[str, str]:
+    """Returns {transactionId: pageId} for transactions in the given date range only."""
+    date_filter = {
+        "and": [
+            {"property": "Date", "date": {"on_or_after": start_date}},
+            {"property": "Date", "date": {"on_or_before": end_date}},
+        ]
+    }
     result = {}
-    for page in notion_query_all(NOTION_TRANSACTIONS_DB_ID):
+    for page in notion_query_filtered(NOTION_TRANSACTIONS_DB_ID, date_filter):
         rt = page["properties"].get("Transaction ID", {}).get("rich_text", [])
         if rt:
             result[rt[0]["plain_text"]] = page["id"]
     return result
 
 
-def notion_fetch_existing_dagomzet() -> dict[str, str]:
-    """Returns {'datum|artist': pageId} from Dagomzet DB."""
+def notion_fetch_existing_dagomzet(start_date: str, end_date: str) -> dict[str, str]:
+    """Returns {'datum|artist': pageId} for dagomzet rows matching the date range."""
     if not NOTION_DAGOMZET_DB_ID:
         return {}
+    # Datum is a title field, so we fetch all and filter in Python (small table)
     result = {}
     for page in notion_query_all(NOTION_DAGOMZET_DB_ID):
         props = page["properties"]
@@ -219,7 +249,7 @@ def notion_fetch_existing_dagomzet() -> dict[str, str]:
         artist_sel = props.get("Artist", {}).get("select", {})
         datum = datum_title[0]["plain_text"] if datum_title else ""
         artist = artist_sel.get("name", "")
-        if datum and artist:
+        if datum and artist and start_date <= datum <= end_date:
             result[f"{datum}|{artist}"] = page["id"]
     return result
 
@@ -431,10 +461,10 @@ def sync(start_date: str, end_date: str) -> None:
     catalog = notion_fetch_product_catalog()
     logger.info("Product catalog: %d products", len(catalog))
 
-    logger.info("Fetching existing Notion data...")
-    existing_tx = notion_fetch_existing_tx_ids()
-    existing_dag = notion_fetch_existing_dagomzet()
-    logger.info("Existing: %d transactions, %d dagomzet rows", len(existing_tx), len(existing_dag))
+    logger.info("Fetching existing Notion data for %s → %s...", start_date, end_date)
+    existing_tx = notion_fetch_existing_tx_ids(start_date, end_date)
+    existing_dag = notion_fetch_existing_dagomzet(start_date, end_date)
+    logger.info("Existing in range: %d transactions, %d dagomzet rows", len(existing_tx), len(existing_dag))
 
     logger.info("Fetching Zettle data (%s → %s)...", start_date, end_date)
     all_lines: list[dict] = []

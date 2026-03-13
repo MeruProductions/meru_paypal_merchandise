@@ -1,91 +1,40 @@
-# Zettle → Notion Transaction Sync
+# Zettle → Notion Daily Sync
 
-Syncs transactions from two Zettle accounts into Notion databases with VAT/fee calculations and artist tagging.
+Dagelijkse sync van Zettle transacties (TimZingt & Matthijn) naar Notion.
 
-## Setup
+## Wat het doet
 
-### 1. Install dependencies
+1. Haalt purchases op van beide Zettle accounts
+2. Haalt Zettle fees op via de Finance API
+3. Zoekt product info op in de Notion product catalog (artist, product group, display name)
+4. Pusht individuele transactie-regels naar **Zettle Transactions** database
+5. Aggregeert per dag per artist en pusht naar **Zettle Dagomzet** database
 
-```bash
-pip install -r requirements.txt
-```
+## Dagelijkse cron
 
-### 2. Configure credentials
+Draait automatisch elke dag om 06:00 UTC via GitHub Actions. Synct de verkopen van gisteren.
+
+Handmatig starten: Actions → Daily Zettle → Notion Sync → Run workflow (optioneel met start/end date).
+
+## GitHub Secrets
+
+Stel de volgende secrets in via Settings → Secrets → Actions:
+
+| Secret | Beschrijving |
+|--------|-------------|
+| `MERU_PAYPAL_TIMZINGT` | Zettle API key TimZingt |
+| `MERU_PAYPAL_MATTHIJN` | Zettle API key Matthijn |
+| `NOTION_API_KEY` | Notion integration token |
+| `NOTION_TRANSACTIONS_DB_ID` | `600c35eb-040d-45bf-a0ff-a2bfdf7c5057` |
+| `NOTION_DAGOMZET_DB_ID` | `322752dc-7cfe-8135-8ac2-c4d34cd7c2bd` |
+| `NOTION_PRODUCTS_DB_ID` | `d564ed56-dd17-4ad8-a5c6-876122983299` |
+
+## Lokaal draaien
 
 ```bash
 cp .env.example .env
+# Vul .env in met je credentials
+pip install -r requirements.txt
+python zettle_sync.py                                    # gisteren
+python zettle_sync.py --start-date 2025-01-01 --end-date 2025-12-31  # custom range
 ```
-
-Edit `.env` with your actual credentials:
-
-- **Zettle**: Create an API app at [Zettle Developer Portal](https://developer.zettle.com/) for each account. You need the `client_id` and a JWT assertion (`client_secret`).
-- **Notion**: Create an integration at [Notion Developers](https://www.notion.so/my-integrations), share your databases with it, and copy the database IDs.
-
-### 3. Notion database schema
-
-#### Zettle Transactions database
-
-| Property         | Type      |
-|------------------|-----------|
-| Product          | Title     |
-| Transaction ID   | Rich Text |
-| Date             | Date      |
-| Artist           | Select    |
-| Product Group    | Select    |
-| Quantity         | Number    |
-| Amount Gross     | Number    |
-| VAT Rate         | Number    |
-| VAT Amount       | Number    |
-| Amount Net       | Number    |
-| Zettle Fee       | Number    |
-| Amount After Fees| Number    |
-
-#### Zettle Summary database (optional)
-
-| Property         | Type      |
-|------------------|-----------|
-| Product Group    | Title     |
-| Artist           | Select    |
-| Total Quantity   | Number    |
-| Total Gross      | Number    |
-| Total Net        | Number    |
-| Total Fees       | Number    |
-| Total After Fees | Number    |
-
-## Usage
-
-```bash
-python zettle_sync.py --start-date 2026-03-01 --end-date 2026-03-31
-```
-
-### What it does
-
-1. Authenticates with both Zettle accounts via OAuth2
-2. Fetches all purchases within the date range
-3. Enriches each product line with:
-   - **VAT calculation**: 21% standard, 9% for food/drinks/books
-   - **Fee distribution**: Zettle fee split proportionally across product lines
-   - **Artist tag**: Based on which account the transaction came from
-   - **Product group**: Extracted from the first word of the product name
-4. Checks Notion for existing Transaction IDs (duplicate prevention)
-5. Pushes new transactions to the Transactions database
-6. Updates the Summary database with aggregated totals
-
-### Idempotency
-
-Safe to run multiple times — transactions are deduplicated by their unique Transaction ID. Running 3x/week will never create duplicate entries.
-
-### Logs
-
-- Console: summary info
-- File: detailed debug log in `zettle_sync.log`
-- Last sync timestamp saved in `.last_sync`
-
-## VAT Rules (NL)
-
-| Rate | Products                    |
-|------|-----------------------------|
-| 21%  | Default (merch, vinyl, etc) |
-| 9%   | Food, drinks, books         |
-
-To customize which product groups use 9% VAT, edit the `REDUCED_VAT_PRODUCTS` set in `zettle_sync.py`.

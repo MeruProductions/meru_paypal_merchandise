@@ -1,0 +1,45 @@
+name: Daily Zettle → Notion Sync
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC (07:00/08:00 CET/CEST)
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date (YYYY-MM-DD), default: yesterday'
+        required: false
+      end_date:
+        description: 'End date (YYYY-MM-DD), default: yesterday'
+        required: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Zettle sync
+        env:
+          MERU_PAYPAL_TIMZINGT: ${{ secrets.MERU_PAYPAL_TIMZINGT }}
+          MERU_PAYPAL_MATTHIJN: ${{ secrets.MERU_PAYPAL_MATTHIJN }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_TRANSACTIONS_DB_ID: ${{ secrets.NOTION_TRANSACTIONS_DB_ID }}
+          NOTION_DAGOMZET_DB_ID: ${{ secrets.NOTION_DAGOMZET_DB_ID }}
+          NOTION_PRODUCTS_DB_ID: ${{ secrets.NOTION_PRODUCTS_DB_ID }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.start_date }}" ]; then
+            ARGS="$ARGS --start-date ${{ github.event.inputs.start_date }}"
+          fi
+          if [ -n "${{ github.event.inputs.end_date }}" ]; then
+            ARGS="$ARGS --end-date ${{ github.event.inputs.end_date }}"
+          fi
+          python zettle_sync.py $ARGS

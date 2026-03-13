@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-Zettle → Notion Transaction Sync
+Zettle → Notion Daily Sync
 
-Pulls transactions from two Zettle accounts, enriches data with
-VAT/fee calculations and artist tags, and pushes to Notion databases.
+Pulls transactions from two Zettle accounts (TimZingt & Matthijn),
+enriches with fees from the Finance API and product catalog from Notion,
+and pushes to two Notion databases:
+  1. Zettle Transactions — one row per product line
+  2. Zettle Dagomzet — one row per artist per day (aggregated)
 
 Usage:
-    python zettle_sync.py --start-date 2026-03-01 --end-date 2026-03-31
+    python zettle_sync.py                          # sync yesterday
+    python zettle_sync.py --start-date 2025-03-01 --end-date 2025-03-31
 """
 
 import argparse
+import base64
 import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -28,43 +33,26 @@ load_dotenv()
 
 ZETTLE_TOKEN_URL = "https://oauth.zettle.com/token"
 ZETTLE_PURCHASES_URL = "https://purchase.izettle.com/purchases/v2"
+ZETTLE_FINANCE_URL = "https://finance.izettle.com/v2/accounts/LIQUID/transactions"
 
 NOTION_API_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
-LOG_FILE = os.getenv("LOG_FILE", "zettle_sync.log")
-LAST_SYNC_FILE = os.getenv("LAST_SYNC_FILE", ".last_sync")
-
-# VAT rates (Netherlands)
-VAT_STANDARD = 0.21
-VAT_REDUCED = 0.09
-
-# Product groups that use reduced VAT (9%)
-REDUCED_VAT_PRODUCTS = {"food", "drinks", "boeken", "books"}
-
-# Product group extraction: first word of the product name
-# e.g. "T-shirt M" → "T-shirt", "Vinyl LP" → "Vinyl"
-
-# Each entry: (env_var_name, artist_display_name)
 ACCOUNT_DEFS = [
-    ("MERU_PAYPAL_MATTHIJN", "Matthijn"),
     ("MERU_PAYPAL_TIMZINGT", "TimZingt"),
+    ("MERU_PAYPAL_MATTHIJN", "Matthijn"),
 ]
 
 ACCOUNTS = []
 for env_var, artist_name in ACCOUNT_DEFS:
     api_key = os.getenv(env_var)
     if api_key:
-        ACCOUNTS.append(
-            {
-                "api_key": api_key,
-                "artist_name": artist_name,
-            }
-        )
+        ACCOUNTS.append({"api_key": api_key, "artist_name": artist_name})
 
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "")
 NOTION_TRANSACTIONS_DB_ID = os.getenv("NOTION_TRANSACTIONS_DB_ID", "")
-NOTION_SUMMARY_DB_ID = os.getenv("NOTION_SUMMARY_DB_ID", "")
+NOTION_DAGOMZET_DB_ID = os.getenv("NOTION_DAGOMZET_DB_ID", "")
+NOTION_PRODUCTS_DB_ID = os.getenv("NOTION_PRODUCTS_DB_ID", "")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -73,17 +61,9 @@ NOTION_SUMMARY_DB_ID = os.getenv("NOTION_SUMMARY_DB_ID", "")
 logger = logging.getLogger("zettle_sync")
 logger.setLevel(logging.DEBUG)
 
-file_handler = logging.FileHandler(LOG_FILE)
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(
-    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-)
-
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter("%(message)s"))
-
-logger.addHandler(file_handler)
+console_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 logger.addHandler(console_handler)
 
 
@@ -93,11 +73,13 @@ logger.addHandler(console_handler)
 
 
 def zettle_get_token(api_key: str) -> str:
-    """Obtain an OAuth2 access token from Zettle using the API key."""
+    payload = json.loads(base64.urlsafe_b64decode(api_key.split(".")[1] + "=="))
+    client_id = payload.get("client_id") or payload.get("sub")
     resp = requests.post(
         ZETTLE_TOKEN_URL,
         data={
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "client_id": client_id,
             "assertion": api_key,
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -107,17 +89,10 @@ def zettle_get_token(api_key: str) -> str:
     return resp.json()["access_token"]
 
 
-def zettle_fetch_purchases(
-    token: str, start_date: str, end_date: str
-) -> list[dict]:
-    """Fetch all purchases within the date range (paginated)."""
+def zettle_fetch_purchases(token: str, start_date: str, end_date: str) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     all_purchases = []
-    params = {
-        "startDate": f"{start_date}T00:00:00.000Z",
-        "endDate": f"{end_date}T23:59:59.999Z",
-        "limit": 100,
-    }
+    params = {"startDate": start_date, "endDate": end_date, "limit": "1000"}
 
     while True:
         resp = requests.get(
@@ -126,92 +101,45 @@ def zettle_fetch_purchases(
         resp.raise_for_status()
         data = resp.json()
         purchases = data.get("purchases", [])
-        all_purchases.extend(purchases)
-
-        last_id = data.get("lastPurchaseHash")
-        if not last_id or len(purchases) < 100:
+        if not purchases:
             break
-        params["lastPurchaseHash"] = last_id
+        all_purchases.extend(purchases)
+        last_hash = data.get("lastPurchaseHash")
+        if not last_hash:
+            break
+        params["lastPurchaseHash"] = last_hash
 
     return all_purchases
 
 
-# ---------------------------------------------------------------------------
-# Data Enrichment
-# ---------------------------------------------------------------------------
+def zettle_fetch_fees(token: str, start_date: str, end_date: str) -> dict[str, float]:
+    """Fetch payment fees from Finance API. Returns {paymentUuid: feeEur}."""
+    headers = {"Authorization": f"Bearer {token}"}
+    fee_map: dict[str, float] = {}
+    offset = 0
 
-
-def extract_product_group(product_name: str) -> str:
-    """Extract product group from product name (first word)."""
-    if not product_name:
-        return "Unknown"
-    return product_name.strip().split()[0]
-
-
-def get_vat_rate(product_group: str) -> float:
-    """Return VAT rate based on product group."""
-    if product_group.lower() in REDUCED_VAT_PRODUCTS:
-        return VAT_REDUCED
-    return VAT_STANDARD
-
-
-def enrich_transaction(purchase: dict, artist_name: str) -> list[dict]:
-    """
-    Enrich a Zettle purchase into one or more transaction records.
-    Each product line in a purchase becomes its own transaction row.
-    """
-    records = []
-    purchase_id = purchase.get("purchaseUUID") or purchase.get("purchaseUUID1")
-    timestamp = purchase.get("timestamp", "")
-    zettle_fee_total = abs(purchase.get("fee", {}).get("amount", 0)) / 100
-
-    products = purchase.get("products", [])
-    gross_total = sum(
-        (p.get("unitPrice", 0) * p.get("quantity", 1)) for p in products
-    ) / 100
-
-    for product in products:
-        product_name = product.get("name", "Unknown")
-        quantity = product.get("quantity", 1)
-        unit_price = product.get("unitPrice", 0) / 100
-        line_gross = unit_price * quantity
-
-        product_group = extract_product_group(product_name)
-        vat_rate = get_vat_rate(product_group)
-
-        # Gross is VAT-inclusive → Net = Gross / (1 + VAT)
-        line_net = round(line_gross / (1 + vat_rate), 2)
-        line_vat = round(line_gross - line_net, 2)
-
-        # Distribute Zettle fee proportionally across product lines
-        fee_share = (
-            round(zettle_fee_total * (line_gross / gross_total), 2)
-            if gross_total
-            else 0
+    while True:
+        params = {
+            "start": f"{start_date}T00:00:00.000Z",
+            "end": f"{end_date}T23:59:59.999Z",
+            "includeTransactionType": "PAYMENT_FEE",
+            "limit": "10000",
+            "offset": str(offset),
+        }
+        resp = requests.get(
+            ZETTLE_FINANCE_URL, headers=headers, params=params, timeout=30
         )
-        line_after_fees = round(line_net - fee_share, 2)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            break
+        for tx in data:
+            fee_map[tx["originatingTransactionUuid"]] = abs(tx["amount"]) / 100
+        offset += len(data)
+        if len(data) < 10000:
+            break
 
-        row_id = f"{purchase_id}_{product.get('productUuid', product_name)}"
-
-        records.append(
-            {
-                "transaction_id": row_id,
-                "purchase_id": purchase_id,
-                "date": timestamp,
-                "artist": artist_name,
-                "product_name": product_name,
-                "product_group": product_group,
-                "quantity": quantity,
-                "amount_gross": line_gross,
-                "vat_rate": vat_rate,
-                "vat_amount": line_vat,
-                "amount_net": line_net,
-                "zettle_fee": fee_share,
-                "amount_after_fees": line_after_fees,
-            }
-        )
-
-    return records
+    return fee_map
 
 
 # ---------------------------------------------------------------------------
@@ -227,292 +155,327 @@ def notion_headers() -> dict:
     }
 
 
-def notion_query_existing_ids(database_id: str) -> set[str]:
-    """Fetch all existing transaction_ids from Notion for duplicate detection."""
-    existing = set()
-    url = f"{NOTION_API_URL}/databases/{database_id}/query"
-    has_more = True
+def notion_query_all(database_id: str) -> list[dict]:
+    """Fetch all pages from a Notion database."""
+    pages = []
     start_cursor = None
-
-    while has_more:
-        body = {"page_size": 100}
+    while True:
+        body: dict = {"page_size": 100}
         if start_cursor:
             body["start_cursor"] = start_cursor
-
         resp = requests.post(
-            url, headers=notion_headers(), json=body, timeout=30
+            f"{NOTION_API_URL}/databases/{database_id}/query",
+            headers=notion_headers(),
+            json=body,
+            timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
-
-        for page in data.get("results", []):
-            props = page.get("properties", {})
-            tid_prop = props.get("Transaction ID", {})
-            rich_text = tid_prop.get("rich_text", [])
-            if rich_text:
-                existing.add(rich_text[0].get("plain_text", ""))
-
-        has_more = data.get("has_more", False)
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
         start_cursor = data.get("next_cursor")
-
-    return existing
-
-
-def notion_create_transaction(database_id: str, record: dict) -> str:
-    """Create a single transaction page in Notion. Returns the page ID."""
-    url = f"{NOTION_API_URL}/pages"
-
-    date_str = record["date"]
-    if date_str:
-        # Parse ISO timestamp to date-only for Notion
-        try:
-            date_str = datetime.fromisoformat(
-                date_str.replace("Z", "+00:00")
-            ).strftime("%Y-%m-%d")
-        except (ValueError, AttributeError):
-            pass
-
-    properties = {
-        "Transaction ID": {
-            "rich_text": [{"text": {"content": record["transaction_id"]}}]
-        },
-        "Date": {"date": {"start": date_str}} if date_str else {"date": None},
-        "Artist": {"select": {"name": record["artist"]}},
-        "Product": {
-            "title": [{"text": {"content": record["product_name"]}}]
-        },
-        "Product Group": {"select": {"name": record["product_group"]}},
-        "Quantity": {"number": record["quantity"]},
-        "Amount Gross": {"number": record["amount_gross"]},
-        "VAT Rate": {"number": record["vat_rate"]},
-        "VAT Amount": {"number": record["vat_amount"]},
-        "Amount Net": {"number": record["amount_net"]},
-        "Zettle Fee": {"number": record["zettle_fee"]},
-        "Amount After Fees": {"number": record["amount_after_fees"]},
-    }
-
-    body = {"parent": {"database_id": database_id}, "properties": properties}
-    resp = requests.post(url, headers=notion_headers(), json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["id"]
+    return pages
 
 
-def notion_update_summary(database_id: str, records: list[dict]) -> None:
-    """
-    Update (or create) summary rows in the Notion Summary database.
-    Groups by artist + product_group and upserts totals.
-    """
-    if not database_id:
-        logger.info("No summary database configured, skipping summary update.")
-        return
-
-    # Aggregate
-    summary: dict[tuple[str, str], dict] = {}
-    for r in records:
-        key = (r["artist"], r["product_group"])
-        if key not in summary:
-            summary[key] = {
-                "artist": r["artist"],
-                "product_group": r["product_group"],
-                "total_quantity": 0,
-                "total_gross": 0.0,
-                "total_net": 0.0,
-                "total_fees": 0.0,
-                "total_after_fees": 0.0,
+def notion_fetch_product_catalog() -> dict[str, dict]:
+    """Fetch Zettle Products catalog. Returns {zettleProductUuid: {artist, productGroup, displayName, pageId}}."""
+    if not NOTION_PRODUCTS_DB_ID:
+        return {}
+    catalog = {}
+    for page in notion_query_all(NOTION_PRODUCTS_DB_ID):
+        props = page["properties"]
+        uuid_text = props.get("Zettle Product UUID", {}).get("rich_text", [])
+        uuid = uuid_text[0]["plain_text"] if uuid_text else ""
+        if uuid:
+            title = props.get("Display Name", {}).get("title", [])
+            catalog[uuid] = {
+                "artist": props.get("Artist", {}).get("select", {}).get("name", ""),
+                "productGroup": props.get("Product Group", {}).get("select", {}).get("name", ""),
+                "displayName": title[0]["plain_text"] if title else "",
+                "pageId": page["id"],
             }
-        s = summary[key]
-        s["total_quantity"] += r["quantity"]
-        s["total_gross"] += r["amount_gross"]
-        s["total_net"] += r["amount_net"]
-        s["total_fees"] += r["zettle_fee"]
-        s["total_after_fees"] += r["amount_after_fees"]
+    return catalog
 
-    # Query existing summary pages to find matches
-    existing_pages: dict[tuple[str, str], str] = {}
-    url = f"{NOTION_API_URL}/databases/{database_id}/query"
-    resp = requests.post(
-        url, headers=notion_headers(), json={"page_size": 100}, timeout=30
-    )
-    resp.raise_for_status()
-    for page in resp.json().get("results", []):
-        props = page.get("properties", {})
-        artist_prop = props.get("Artist", {}).get("select", {})
-        group_title = props.get("Product Group", {}).get("title", [])
-        if artist_prop and group_title:
-            a = artist_prop.get("name", "")
-            g = group_title[0].get("plain_text", "")
-            existing_pages[(a, g)] = page["id"]
 
-    for key, s in summary.items():
-        properties = {
-            "Product Group": {
-                "title": [{"text": {"content": s["product_group"]}}]
-            },
-            "Artist": {"select": {"name": s["artist"]}},
-            "Total Quantity": {"number": s["total_quantity"]},
-            "Total Gross": {"number": round(s["total_gross"], 2)},
-            "Total Net": {"number": round(s["total_net"], 2)},
-            "Total Fees": {"number": round(s["total_fees"], 2)},
-            "Total After Fees": {"number": round(s["total_after_fees"], 2)},
-        }
+def notion_fetch_existing_tx_ids() -> dict[str, str]:
+    """Returns {transactionId: pageId} from Zettle Transactions DB."""
+    result = {}
+    for page in notion_query_all(NOTION_TRANSACTIONS_DB_ID):
+        rt = page["properties"].get("Transaction ID", {}).get("rich_text", [])
+        if rt:
+            result[rt[0]["plain_text"]] = page["id"]
+    return result
 
-        if key in existing_pages:
-            page_id = existing_pages[key]
-            requests.patch(
-                f"{NOTION_API_URL}/pages/{page_id}",
-                headers=notion_headers(),
-                json={"properties": properties},
-                timeout=30,
-            ).raise_for_status()
-            logger.debug("Updated summary: %s / %s", *key)
-        else:
-            requests.post(
-                f"{NOTION_API_URL}/pages",
-                headers=notion_headers(),
-                json={
-                    "parent": {"database_id": database_id},
-                    "properties": properties,
-                },
-                timeout=30,
-            ).raise_for_status()
-            logger.debug("Created summary: %s / %s", *key)
 
-    logger.info("Summary database updated with %d groups.", len(summary))
+def notion_fetch_existing_dagomzet() -> dict[str, str]:
+    """Returns {'datum|artist': pageId} from Dagomzet DB."""
+    if not NOTION_DAGOMZET_DB_ID:
+        return {}
+    result = {}
+    for page in notion_query_all(NOTION_DAGOMZET_DB_ID):
+        props = page["properties"]
+        datum_title = props.get("Datum", {}).get("title", [])
+        artist_sel = props.get("Artist", {}).get("select", {})
+        datum = datum_title[0]["plain_text"] if datum_title else ""
+        artist = artist_sel.get("name", "")
+        if datum and artist:
+            result[f"{datum}|{artist}"] = page["id"]
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Main Sync Logic
+# Data Processing
+# ---------------------------------------------------------------------------
+
+
+def process_account(
+    api_key: str, artist_name: str, start_date: str, end_date: str, catalog: dict
+) -> list[dict]:
+    """Fetch and enrich all product lines for one Zettle account."""
+    token = zettle_get_token(api_key)
+    purchases = zettle_fetch_purchases(token, start_date, end_date)
+    fee_map = zettle_fetch_fees(token, start_date, end_date)
+
+    logger.info(
+        "  %s: %d purchases, %d fee records", artist_name, len(purchases), len(fee_map)
+    )
+
+    lines = []
+    for purchase in purchases:
+        purchase_id = purchase.get("purchaseUUID1") or purchase.get("purchaseUUID")
+        timestamp = purchase.get("timestamp", "")
+        date_str = timestamp.split("T")[0] if timestamp else ""
+
+        # Calculate total fee for this purchase from Finance API
+        total_fee = 0.0
+        for payment in purchase.get("payments", []):
+            fee = fee_map.get(payment["uuid"], 0)
+            total_fee += fee
+
+        total_gross = abs(purchase.get("amount", 0)) / 100
+
+        for product in purchase.get("products", []):
+            product_uuid = product.get("productUuid", "")
+            cat = catalog.get(product_uuid, {})
+            artist = cat.get("artist") or artist_name
+            display_name = cat.get("displayName") or product.get("name", "Unknown")
+            product_group = cat.get("productGroup", "")
+            page_id = cat.get("pageId", "")
+
+            qty = int(product.get("quantity", 1))
+            unit_price = product.get("unitPrice", 0) / 100
+            gross = round(unit_price * qty, 2)
+            vat_pct = product.get("vatPercentage", 21)
+            taxable = product.get("rowTaxableAmount", 0) / 100
+            vat_amount = round(gross - taxable, 2)
+            discount_val = (product.get("discountValue") or 0) / 100
+
+            # Proportional fee
+            prop_fee = round(total_fee * (gross / total_gross), 2) if total_gross else 0
+            netto = round(gross - vat_amount - prop_fee - discount_val, 2)
+
+            discount_name = ""
+            for d in purchase.get("discounts", []):
+                if d.get("name"):
+                    discount_name = d["name"]
+                    break
+
+            lines.append({
+                "transaction_id": purchase_id,
+                "date": date_str,
+                "artist": artist,
+                "product_name": display_name,
+                "product_uuid": product_uuid,
+                "product_group": product_group,
+                "product_ref_page_id": page_id,
+                "quantity": qty,
+                "gross": gross,
+                "vat_rate": vat_pct / 100,
+                "vat_amount": vat_amount,
+                "net": taxable,
+                "fee": prop_fee,
+                "after_fees": round(gross - prop_fee, 2),
+                "discount_amount": discount_val,
+                "discount_name": discount_name,
+                "netto_inkomsten": netto,
+            })
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Notion Sync
+# ---------------------------------------------------------------------------
+
+
+def sync_transactions(lines: list[dict], existing: dict[str, str]) -> tuple[int, int]:
+    """Sync product lines to Zettle Transactions DB. Returns (created, updated)."""
+    created = updated = 0
+
+    for line in lines:
+        props: dict = {
+            "Product": {"title": [{"text": {"content": line["product_name"]}}]},
+            "Transaction ID": {"rich_text": [{"text": {"content": line["transaction_id"]}}]},
+            "Date": {"date": {"start": line["date"]}} if line["date"] else {"date": None},
+            "Artist": {"select": {"name": line["artist"]}},
+            "Quantity": {"number": line["quantity"]},
+            "Amount Gross": {"number": line["gross"]},
+            "Amount Net": {"number": line["net"]},
+            "Amount After Fees": {"number": line["after_fees"]},
+            "VAT Rate": {"number": line["vat_rate"]},
+            "VAT Amount": {"number": line["vat_amount"]},
+            "Zettle Fee": {"number": line["fee"]},
+            "Discount Amount": {"number": line["discount_amount"]},
+            "Discount Name": {"rich_text": [{"text": {"content": line["discount_name"]}}]},
+        }
+        if line["product_group"]:
+            props["Product Group"] = {"select": {"name": line["product_group"]}}
+        if line["product_ref_page_id"]:
+            props["Product Ref"] = {"relation": [{"id": line["product_ref_page_id"]}]}
+
+        try:
+            page_id = existing.get(line["transaction_id"])
+            if page_id:
+                requests.patch(
+                    f"{NOTION_API_URL}/pages/{page_id}",
+                    headers=notion_headers(),
+                    json={"properties": props},
+                    timeout=30,
+                ).raise_for_status()
+                updated += 1
+            else:
+                requests.post(
+                    f"{NOTION_API_URL}/pages",
+                    headers=notion_headers(),
+                    json={"parent": {"database_id": NOTION_TRANSACTIONS_DB_ID}, "properties": props},
+                    timeout=30,
+                ).raise_for_status()
+                created += 1
+        except requests.RequestException as e:
+            logger.error("  Failed %s: %s", line["transaction_id"], e)
+
+    return created, updated
+
+
+def sync_dagomzet(lines: list[dict], existing: dict[str, str]) -> tuple[int, int]:
+    """Aggregate lines per date+artist and sync to Dagomzet DB."""
+    if not NOTION_DAGOMZET_DB_ID:
+        return 0, 0
+
+    agg: dict[str, dict] = {}
+    for line in lines:
+        key = f"{line['date']}|{line['artist']}"
+        if key not in agg:
+            agg[key] = {"bruto": 0, "btw": 0, "fee": 0, "korting": 0, "count": 0}
+        a = agg[key]
+        a["bruto"] += line["gross"]
+        a["btw"] += line["vat_amount"]
+        a["fee"] += line["fee"]
+        a["korting"] += line["discount_amount"]
+        a["count"] += 1
+
+    created = updated = 0
+    for key, a in agg.items():
+        datum, artist = key.split("|")
+        netto = round(a["bruto"] - a["btw"] - a["fee"] - a["korting"], 2)
+        props = {
+            "Datum": {"title": [{"text": {"content": datum}}]},
+            "Artist": {"select": {"name": artist}},
+            "Netto Inkomsten": {"number": netto},
+            "Bruto": {"number": round(a["bruto"], 2)},
+            "BTW": {"number": round(a["btw"], 2)},
+            "Zettle Fee": {"number": round(a["fee"], 2)},
+            "Korting": {"number": round(a["korting"], 2)},
+            "Transacties": {"number": a["count"]},
+        }
+
+        try:
+            page_id = existing.get(key)
+            if page_id:
+                requests.patch(
+                    f"{NOTION_API_URL}/pages/{page_id}",
+                    headers=notion_headers(),
+                    json={"properties": props},
+                    timeout=30,
+                ).raise_for_status()
+                updated += 1
+            else:
+                requests.post(
+                    f"{NOTION_API_URL}/pages",
+                    headers=notion_headers(),
+                    json={"parent": {"database_id": NOTION_DAGOMZET_DB_ID}, "properties": props},
+                    timeout=30,
+                ).raise_for_status()
+                created += 1
+        except requests.RequestException as e:
+            logger.error("  Failed dagomzet %s: %s", key, e)
+
+    return created, updated
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 
 def sync(start_date: str, end_date: str) -> None:
     if not ACCOUNTS:
-        logger.error(
-            "No Zettle accounts configured. Check your .env file."
-        )
+        logger.error("No Zettle accounts configured. Set MERU_PAYPAL_* env vars.")
         sys.exit(1)
-
     if not NOTION_API_KEY or not NOTION_TRANSACTIONS_DB_ID:
-        logger.error(
-            "Notion API key or Transactions DB ID missing. Check your .env file."
-        )
+        logger.error("Missing NOTION_API_KEY or NOTION_TRANSACTIONS_DB_ID.")
         sys.exit(1)
 
-    # Fetch existing transaction IDs for duplicate detection
-    logger.info("Fetching existing transaction IDs from Notion...")
-    try:
-        existing_ids = notion_query_existing_ids(NOTION_TRANSACTIONS_DB_ID)
-    except requests.RequestException as e:
-        logger.error("Failed to query Notion for existing IDs: %s", e)
-        sys.exit(1)
-    logger.info("Found %d existing transactions in Notion.", len(existing_ids))
+    logger.info("Fetching Notion product catalog...")
+    catalog = notion_fetch_product_catalog()
+    logger.info("Product catalog: %d products", len(catalog))
 
-    all_records: list[dict] = []
-    counts: dict[str, int] = {}
+    logger.info("Fetching existing Notion data...")
+    existing_tx = notion_fetch_existing_tx_ids()
+    existing_dag = notion_fetch_existing_dagomzet()
+    logger.info("Existing: %d transactions, %d dagomzet rows", len(existing_tx), len(existing_dag))
 
+    logger.info("Fetching Zettle data (%s → %s)...", start_date, end_date)
+    all_lines: list[dict] = []
     for account in ACCOUNTS:
-        artist = account["artist_name"]
-        logger.info("Processing account: %s", artist)
-
-        # Authenticate
         try:
-            token = zettle_get_token(account["api_key"])
+            lines = process_account(
+                account["api_key"], account["artist_name"], start_date, end_date, catalog
+            )
+            all_lines.extend(lines)
         except requests.RequestException as e:
-            logger.error("Auth failed for %s: %s", artist, e)
-            continue
+            logger.error("Failed for %s: %s", account["artist_name"], e)
 
-        # Fetch purchases
-        try:
-            purchases = zettle_fetch_purchases(token, start_date, end_date)
-        except requests.RequestException as e:
-            logger.error("Fetch failed for %s: %s", artist, e)
-            continue
+    logger.info("Total product lines: %d", len(all_lines))
 
-        logger.info("Fetched %d purchases for %s.", len(purchases), artist)
+    if not all_lines:
+        logger.info("No transactions found, nothing to sync.")
+        return
 
-        # Enrich and collect
-        artist_records = []
-        for purchase in purchases:
-            enriched = enrich_transaction(purchase, artist)
-            artist_records.extend(enriched)
+    logger.info("Syncing transactions to Notion...")
+    tx_created, tx_updated = sync_transactions(all_lines, existing_tx)
+    logger.info("Transactions: %d created, %d updated", tx_created, tx_updated)
 
-        all_records.extend(artist_records)
-        counts[artist] = 0
+    logger.info("Syncing dagomzet to Notion...")
+    dag_created, dag_updated = sync_dagomzet(all_lines, existing_dag)
+    logger.info("Dagomzet: %d created, %d updated", dag_created, dag_updated)
 
-        # Push to Notion (skip duplicates)
-        for record in artist_records:
-            if record["transaction_id"] in existing_ids:
-                logger.debug("Skipping duplicate: %s", record["transaction_id"])
-                continue
-
-            try:
-                notion_create_transaction(
-                    NOTION_TRANSACTIONS_DB_ID, record
-                )
-                existing_ids.add(record["transaction_id"])
-                counts[artist] += 1
-            except requests.RequestException as e:
-                logger.error(
-                    "Failed to push transaction %s: %s",
-                    record["transaction_id"],
-                    e,
-                )
-
-    # Update summary
-    if all_records:
-        try:
-            notion_update_summary(NOTION_SUMMARY_DB_ID, all_records)
-        except requests.RequestException as e:
-            logger.error("Failed to update summary: %s", e)
-
-    # Print summary
-    logger.info("--- Sync Complete ---")
-    for artist, count in counts.items():
-        logger.info("Synced %d new transactions for %s", count, artist)
-
-    total = sum(counts.values())
-    logger.info("Total new transactions synced: %d", total)
-
-    # Save last sync timestamp
-    Path(LAST_SYNC_FILE).write_text(
-        datetime.now(timezone.utc).isoformat(), encoding="utf-8"
-    )
-    logger.info("Last sync timestamp saved to %s", LAST_SYNC_FILE)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+    logger.info("Done!")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sync Zettle transactions to Notion"
-    )
-    parser.add_argument(
-        "--start-date",
-        required=True,
-        help="Start date (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--end-date",
-        required=True,
-        help="End date (YYYY-MM-DD)",
-    )
+    parser = argparse.ArgumentParser(description="Sync Zettle transactions to Notion")
+    parser.add_argument("--start-date", help="Start date (YYYY-MM-DD), default: yesterday")
+    parser.add_argument("--end-date", help="End date (YYYY-MM-DD), default: yesterday")
     args = parser.parse_args()
 
-    # Validate dates
-    for label, val in [("start-date", args.start_date), ("end-date", args.end_date)]:
-        try:
-            datetime.strptime(val, "%Y-%m-%d")
-        except ValueError:
-            logger.error("Invalid %s format: %s (expected YYYY-MM-DD)", label, val)
-            sys.exit(1)
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    start_date = args.start_date or yesterday
+    end_date = args.end_date or yesterday
 
-    logger.info(
-        "Starting Zettle sync: %s → %s", args.start_date, args.end_date
-    )
-    sync(args.start_date, args.end_date)
+    logger.info("Zettle → Notion sync: %s → %s", start_date, end_date)
+    sync(start_date, end_date)
 
 
 if __name__ == "__main__":

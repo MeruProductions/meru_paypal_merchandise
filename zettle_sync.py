@@ -75,6 +75,15 @@ logger.addHandler(console_handler)
 def zettle_get_token(api_key: str) -> str:
     payload = json.loads(base64.urlsafe_b64decode(api_key.split(".")[1] + "=="))
     client_id = payload.get("client_id") or payload.get("sub")
+
+    # Check JWT expiry before attempting token exchange
+    exp = payload.get("exp")
+    if exp and exp < datetime.now(timezone.utc).timestamp():
+        raise RuntimeError(
+            f"Zettle API key is verlopen (exp: {datetime.fromtimestamp(exp, tz=timezone.utc).strftime('%Y-%m-%d')}). "
+            "Genereer een nieuwe key in de Zettle Developer Portal."
+        )
+
     resp = requests.post(
         ZETTLE_TOKEN_URL,
         data={
@@ -85,6 +94,11 @@ def zettle_get_token(api_key: str) -> str:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
     )
+    if resp.status_code == 401:
+        raise RuntimeError(
+            f"Zettle auth mislukt (401). API key is mogelijk verlopen of ingetrokken. "
+            f"Response: {resp.text[:200]}"
+        )
     resp.raise_for_status()
     return resp.json()["access_token"]
 
@@ -92,7 +106,11 @@ def zettle_get_token(api_key: str) -> str:
 def zettle_fetch_purchases(token: str, start_date: str, end_date: str) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     all_purchases = []
-    params = {"startDate": start_date, "endDate": end_date, "limit": "1000"}
+    # Zettle API treats endDate as exclusive, so add one day to include end_date
+    end_date_exclusive = (
+        datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    params = {"startDate": start_date, "endDate": end_date_exclusive, "limit": "1000"}
 
     while True:
         resp = requests.get(
@@ -468,14 +486,27 @@ def sync(start_date: str, end_date: str) -> None:
 
     logger.info("Fetching Zettle data (%s → %s)...", start_date, end_date)
     all_lines: list[dict] = []
+    account_errors: list[str] = []
     for account in ACCOUNTS:
         try:
             lines = process_account(
                 account["api_key"], account["artist_name"], start_date, end_date, catalog
             )
             all_lines.extend(lines)
-        except requests.RequestException as e:
-            logger.error("Failed for %s: %s", account["artist_name"], e)
+        except Exception as e:
+            msg = f"{account['artist_name']}: {e}"
+            logger.error("FAILED fetching %s", msg)
+            account_errors.append(msg)
+
+    if account_errors and not all_lines:
+        logger.error("All Zettle accounts failed, no data fetched:")
+        for err in account_errors:
+            logger.error("  - %s", err)
+        sys.exit(1)
+    elif account_errors:
+        logger.warning("Some accounts failed but continuing with partial data:")
+        for err in account_errors:
+            logger.warning("  - %s", err)
 
     logger.info("Total product lines: %d", len(all_lines))
 

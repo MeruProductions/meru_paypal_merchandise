@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -173,6 +174,19 @@ def notion_headers() -> dict:
     }
 
 
+def notion_request(method: str, url: str, **kwargs) -> requests.Response:
+    """Notion API call that retries on rate limits (429) and transient 5xx errors."""
+    for attempt in range(6):
+        resp = requests.request(method, url, headers=notion_headers(), timeout=30, **kwargs)
+        if resp.status_code != 429 and resp.status_code < 500:
+            break
+        wait = float(resp.headers.get("Retry-After", 2 ** attempt))
+        logger.info("  Notion %d, retrying in %.0fs...", resp.status_code, wait)
+        time.sleep(wait)
+    resp.raise_for_status()
+    return resp
+
+
 def notion_query_all(database_id: str) -> list[dict]:
     """Fetch all pages from a Notion database."""
     pages = []
@@ -181,13 +195,9 @@ def notion_query_all(database_id: str) -> list[dict]:
         body: dict = {"page_size": 100}
         if start_cursor:
             body["start_cursor"] = start_cursor
-        resp = requests.post(
-            f"{NOTION_API_URL}/databases/{database_id}/query",
-            headers=notion_headers(),
-            json=body,
-            timeout=30,
+        resp = notion_request(
+            "POST", f"{NOTION_API_URL}/databases/{database_id}/query", json=body
         )
-        resp.raise_for_status()
         data = resp.json()
         pages.extend(data.get("results", []))
         if not data.get("has_more"):
@@ -224,13 +234,9 @@ def notion_query_filtered(database_id: str, date_filter: dict) -> list[dict]:
         body: dict = {"page_size": 100, "filter": date_filter}
         if start_cursor:
             body["start_cursor"] = start_cursor
-        resp = requests.post(
-            f"{NOTION_API_URL}/databases/{database_id}/query",
-            headers=notion_headers(),
-            json=body,
-            timeout=30,
+        resp = notion_request(
+            "POST", f"{NOTION_API_URL}/databases/{database_id}/query", json=body
         )
-        resp.raise_for_status()
         data = resp.json()
         pages.extend(data.get("results", []))
         if not data.get("has_more"):
@@ -239,19 +245,26 @@ def notion_query_filtered(database_id: str, date_filter: dict) -> list[dict]:
     return pages
 
 
-def notion_fetch_existing_tx_ids(start_date: str, end_date: str) -> dict[str, str]:
-    """Returns {transactionId: pageId} for transactions in the given date range only."""
+def notion_fetch_existing_tx_ids(start_date: str, end_date: str) -> dict[str, list[str]]:
+    """Returns {'transactionId|product': [pageId, ...]} for transactions in the given date range only.
+
+    A purchase with several product lines shares one Transaction ID, so the
+    product name is part of the key.
+    """
     date_filter = {
         "and": [
             {"property": "Date", "date": {"on_or_after": start_date}},
             {"property": "Date", "date": {"on_or_before": end_date}},
         ]
     }
-    result = {}
+    result: dict[str, list[str]] = defaultdict(list)
     for page in notion_query_filtered(NOTION_TRANSACTIONS_DB_ID, date_filter):
-        rt = page["properties"].get("Transaction ID", {}).get("rich_text", [])
+        props = page["properties"]
+        rt = props.get("Transaction ID", {}).get("rich_text", [])
+        title = props.get("Product", {}).get("title", [])
         if rt:
-            result[rt[0]["plain_text"]] = page["id"]
+            product = title[0]["plain_text"] if title else ""
+            result[f"{rt[0]['plain_text']}|{product}"].append(page["id"])
     return result
 
 
@@ -357,7 +370,7 @@ def process_account(
 # ---------------------------------------------------------------------------
 
 
-def sync_transactions(lines: list[dict], existing: dict[str, str]) -> tuple[int, int]:
+def sync_transactions(lines: list[dict], existing: dict[str, list[str]]) -> tuple[int, int]:
     """Sync product lines to Zettle Transactions DB. Returns (created, updated)."""
     created = updated = 0
 
@@ -383,22 +396,20 @@ def sync_transactions(lines: list[dict], existing: dict[str, str]) -> tuple[int,
             props["Product Ref"] = {"relation": [{"id": line["product_ref_page_id"]}]}
 
         try:
-            page_id = existing.get(line["transaction_id"])
+            # Each existing page matches at most one line
+            matches = existing.get(f"{line['transaction_id']}|{line['product_name']}")
+            page_id = matches.pop(0) if matches else None
             if page_id:
-                requests.patch(
-                    f"{NOTION_API_URL}/pages/{page_id}",
-                    headers=notion_headers(),
-                    json={"properties": props},
-                    timeout=30,
-                ).raise_for_status()
+                notion_request(
+                    "PATCH", f"{NOTION_API_URL}/pages/{page_id}", json={"properties": props}
+                )
                 updated += 1
             else:
-                requests.post(
+                notion_request(
+                    "POST",
                     f"{NOTION_API_URL}/pages",
-                    headers=notion_headers(),
                     json={"parent": {"database_id": NOTION_TRANSACTIONS_DB_ID}, "properties": props},
-                    timeout=30,
-                ).raise_for_status()
+                )
                 created += 1
         except requests.RequestException as e:
             logger.error("  Failed %s: %s", line["transaction_id"], e)
@@ -441,20 +452,16 @@ def sync_dagomzet(lines: list[dict], existing: dict[str, str]) -> tuple[int, int
         try:
             page_id = existing.get(key)
             if page_id:
-                requests.patch(
-                    f"{NOTION_API_URL}/pages/{page_id}",
-                    headers=notion_headers(),
-                    json={"properties": props},
-                    timeout=30,
-                ).raise_for_status()
+                notion_request(
+                    "PATCH", f"{NOTION_API_URL}/pages/{page_id}", json={"properties": props}
+                )
                 updated += 1
             else:
-                requests.post(
+                notion_request(
+                    "POST",
                     f"{NOTION_API_URL}/pages",
-                    headers=notion_headers(),
                     json={"parent": {"database_id": NOTION_DAGOMZET_DB_ID}, "properties": props},
-                    timeout=30,
-                ).raise_for_status()
+                )
                 created += 1
         except requests.RequestException as e:
             logger.error("  Failed dagomzet %s: %s", key, e)
